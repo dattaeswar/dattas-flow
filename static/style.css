@@ -277,6 +277,15 @@ kbd {
 
 .mobile-hint { display: none; }
 
+.disclaimer {
+  text-align: center;
+  font-size: 11px;
+  color: var(--ink-soft);
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
 @keyframes pulse {
   0% { box-shadow: 0 0 0 0 rgba(217,98,43,0.5); }
   70% { box-shadow: 0 0 0 10px rgba(217,98,43,0); }
