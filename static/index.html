@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Datta's Flow</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-dot">✳</span>
+      <span class="brand-name">Datta's Flow</span>
+      <span class="brand-tag">· your AI companion</span>
+    </div>
+    <button id="voice-toggle" class="pill ghost" title="Toggle spoken replies">🔊 Voice on</button>
+  </header>
+
+  <main class="chat-wrap">
+    <div class="mode-row">
+      <div class="mode-toggle" id="mode-toggle">
+        <button type="button" class="mode-btn active" data-mode="friend">💬 Friend chat</button>
+        <button type="button" class="mode-btn" data-mode="standard">🧠 Standard AI</button>
+      </div>
+      <div class="mode-desc" id="mode-desc">Short, casual replies — like talking to a friend.</div>
+    </div>
+
+    <div id="messages" class="messages">
+      <div class="msg assistant">
+        <div class="bubble">
+          Hi, I'm Datta's Flow. Type a question or tap the mic and just speak — I'll answer out loud, and I can pull in live web results when it helps.
+        </div>
+      </div>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <form id="chat-form" class="input-row">
+      <button type="button" id="mic-btn" class="mic-btn" title="Speak (Ctrl+Shift+Space)">🎤</button>
+      <input id="chat-input" type="text" placeholder="Ask me anything..." autocomplete="off" />
+      <button type="submit" class="pill primary">Send</button>
+    </form>
+    <div class="hint">Tip: press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd> to talk from anywhere on the page</div>
+  </main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
