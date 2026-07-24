@@ -172,6 +172,7 @@ async def chat(req: ChatRequest, request: Request):
     messages.extend({"role": m.role, "content": m.content} for m in trimmed_history)
     messages.append({"role": "user", "content": req.message})
 
+    t0 = time.monotonic()
     try:
         completion = client.chat.completions.create(
             model=NIM_MODEL,
@@ -179,11 +180,16 @@ async def chat(req: ChatRequest, request: Request):
             temperature=0.6,
             max_tokens=4096 if req.mode == "standard" else 2048,
         )
-    except APITimeoutError:
+        print(f"[dattas-flow] NIM call OK in {time.monotonic() - t0:.2f}s")
+    except APITimeoutError as exc:
+        print(f"[dattas-flow] NIM call TIMED OUT after {time.monotonic() - t0:.2f}s: {exc!r}")
         raise HTTPException(status_code=504, detail="The model took too long to respond. Try again.")
     except APIError as exc:
-        logger.error("NIM API error: %s", exc)
+        print(f"[dattas-flow] NIM API ERROR after {time.monotonic() - t0:.2f}s: {exc!r}")
         raise HTTPException(status_code=502, detail="The model is temporarily unavailable. Try again shortly.")
+    except Exception as exc:
+        print(f"[dattas-flow] NIM call UNEXPECTED ERROR after {time.monotonic() - t0:.2f}s: {exc!r}")
+        raise HTTPException(status_code=500, detail="Unexpected error calling the model.")
 
     reply = completion.choices[0].message.content or "Hmm, I didn't get a response there — try asking again?"
     return {"reply": reply, "used_search": search_context is not None}
