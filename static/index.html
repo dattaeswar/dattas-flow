@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <title>Datta's Flow</title>
 <link rel="stylesheet" href="/static/style.css" />
 </head>
@@ -13,7 +13,13 @@
       <span class="brand-name">Datta's Flow</span>
       <span class="brand-tag">· your AI companion</span>
     </div>
-    <button id="voice-toggle" class="pill ghost" title="Toggle spoken replies">🔊 Voice on</button>
+    <div class="voice-settings">
+      <button id="voice-toggle" class="pill ghost" title="Toggle spoken replies">🔊 Voice on</button>
+      <div class="gender-toggle" id="gender-toggle">
+        <button type="button" class="gender-btn active" data-gender="female" title="Female voice">♀</button>
+        <button type="button" class="gender-btn" data-gender="male" title="Male voice">♂</button>
+      </div>
+    </div>
   </header>
 
   <main class="chat-wrap">
@@ -28,7 +34,7 @@
     <div id="messages" class="messages">
       <div class="msg assistant">
         <div class="bubble">
-          Hi, I'm Datta's Flow. Type a question or tap the mic and just speak — I'll answer out loud, and I can pull in live web results when it helps.
+          Hi, I'm Datta's Flow. Type a question, tap the mic, or say "Hey Flow" to talk hands-free — I'll answer out loud, and I can pull in live web results when it helps.
         </div>
       </div>
     </div>
@@ -40,7 +46,11 @@
       <input id="chat-input" type="text" placeholder="Ask me anything..." autocomplete="off" />
       <button type="submit" class="pill primary">Send</button>
     </form>
-    <div class="hint">Tip: press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd> to talk from anywhere on the page</div>
+
+    <button type="button" id="heyflow-toggle" class="pill heyflow-btn">🗣️ Enable "Hey Flow" hands-free</button>
+
+    <div class="hint desktop-hint">Tip: press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd> to talk from anywhere on the page</div>
+    <div class="hint mobile-hint">Tip: turn on "Hey Flow" above, then just say "Hey Flow, ‑ your question" any time the page is open</div>
   </main>
 
 <script src="/static/app.js"></script>
