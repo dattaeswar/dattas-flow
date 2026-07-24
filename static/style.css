@@ -205,7 +205,7 @@ body {
 
 .mic-btn.listening {
   background: var(--orange);
-  animation: pulse 1s infinite;
+  transition: box-shadow 60ms linear;
 }
 
 .heyflow-btn {

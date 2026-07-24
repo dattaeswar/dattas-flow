@@ -1,11 +1,15 @@
+import asyncio
+import io
 import logging
 import os
 import time
+import wave
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Literal
 
 import httpx
+import riva.client
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -18,10 +22,30 @@ logger = logging.getLogger("dattas_flow")
 
 NVIDIA_API_KEY = os.environ["NVIDIA_API_KEY"]
 NIM_MODEL = os.environ.get("NIM_MODEL", "openai/gpt-oss-120b")
+NIM_FALLBACK_MODEL = os.environ.get("NIM_FALLBACK_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 NIM_BASE_URL = os.environ.get("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "").strip()
+RIVA_ASR_URI = os.environ.get("RIVA_ASR_URI", "grpc.nvcf.nvidia.com:443")
+RIVA_ASR_FUNCTION_ID = os.environ.get("RIVA_ASR_FUNCTION_ID", "d3fe9151-442b-4204-a70d-5fcc597fd610")
 
-client = OpenAI(base_url=NIM_BASE_URL, api_key=NVIDIA_API_KEY, timeout=45, max_retries=1)
+client = OpenAI(base_url=NIM_BASE_URL, api_key=NVIDIA_API_KEY, timeout=20, max_retries=0)
+
+_riva_asr_service: riva.client.ASRService | None = None
+
+
+def _get_riva_asr() -> riva.client.ASRService:
+    global _riva_asr_service
+    if _riva_asr_service is None:
+        auth = riva.client.Auth(
+            uri=RIVA_ASR_URI,
+            use_ssl=True,
+            metadata_args=[
+                ["function-id", RIVA_ASR_FUNCTION_ID],
+                ["authorization", f"Bearer {NVIDIA_API_KEY}"],
+            ],
+        )
+        _riva_asr_service = riva.client.ASRService(auth)
+    return _riva_asr_service
 
 app = FastAPI()
 
@@ -41,7 +65,7 @@ async def security_headers(request: Request, call_next):
 # guarantee — pair it with a spend cap on the NVIDIA API key for real protection.
 RATE_LIMIT_MAX_REQUESTS = 20
 RATE_LIMIT_WINDOW_SECONDS = 600
-_request_log: dict[str, deque] = defaultdict(deque)
+_request_log: dict[tuple[str, str], deque] = defaultdict(deque)
 
 
 def _client_ip(request: Request) -> str:
@@ -51,9 +75,10 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _check_rate_limit(ip: str) -> None:
+def _check_rate_limit(bucket: str, ip: str) -> None:
     now = time.monotonic()
-    log = _request_log[ip]
+    key = (bucket, ip)
+    log = _request_log[key]
     while log and now - log[0] > RATE_LIMIT_WINDOW_SECONDS:
         log.popleft()
     if len(log) >= RATE_LIMIT_MAX_REQUESTS:
@@ -150,7 +175,7 @@ async def web_search(query: str) -> str | None:
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest, request: Request):
-    _check_rate_limit(_client_ip(request))
+    _check_rate_limit("chat", _client_ip(request))
 
     system_prompt = STANDARD_SYSTEM_PROMPT if req.mode == "standard" else FRIEND_SYSTEM_PROMPT
     messages = [{"role": "system", "content": system_prompt}]
@@ -172,27 +197,83 @@ async def chat(req: ChatRequest, request: Request):
     messages.extend({"role": m.role, "content": m.content} for m in trimmed_history)
     messages.append({"role": "user", "content": req.message})
 
-    t0 = time.monotonic()
-    try:
-        completion = client.chat.completions.create(
-            model=NIM_MODEL,
-            messages=messages,
-            temperature=0.6,
-            max_tokens=4096 if req.mode == "standard" else 2048,
-        )
-        print(f"[dattas-flow] NIM call OK in {time.monotonic() - t0:.2f}s")
-    except APITimeoutError as exc:
-        print(f"[dattas-flow] NIM call TIMED OUT after {time.monotonic() - t0:.2f}s: {exc!r}")
-        raise HTTPException(status_code=504, detail="The model took too long to respond. Try again.")
-    except APIError as exc:
-        print(f"[dattas-flow] NIM API ERROR after {time.monotonic() - t0:.2f}s: {exc!r}")
+    max_tokens = 4096 if req.mode == "standard" else 2048
+    completion = None
+    for attempt_model in (NIM_MODEL, NIM_FALLBACK_MODEL):
+        t0 = time.monotonic()
+        try:
+            completion = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=attempt_model,
+                messages=messages,
+                temperature=0.6,
+                max_tokens=max_tokens,
+            )
+            print(f"[dattas-flow] NIM call OK ({attempt_model}) in {time.monotonic() - t0:.2f}s")
+            break
+        except APITimeoutError as exc:
+            print(f"[dattas-flow] NIM call TIMED OUT ({attempt_model}) after {time.monotonic() - t0:.2f}s: {exc!r}")
+            continue
+        except APIError as exc:
+            print(f"[dattas-flow] NIM API ERROR ({attempt_model}) after {time.monotonic() - t0:.2f}s: {exc!r}")
+            continue
+        except Exception as exc:
+            print(f"[dattas-flow] NIM call UNEXPECTED ERROR ({attempt_model}) after {time.monotonic() - t0:.2f}s: {exc!r}")
+            raise HTTPException(status_code=500, detail="Unexpected error calling the model.")
+
+    if completion is None:
         raise HTTPException(status_code=502, detail="The model is temporarily unavailable. Try again shortly.")
-    except Exception as exc:
-        print(f"[dattas-flow] NIM call UNEXPECTED ERROR after {time.monotonic() - t0:.2f}s: {exc!r}")
-        raise HTTPException(status_code=500, detail="Unexpected error calling the model.")
 
     reply = completion.choices[0].message.content or "Hmm, I didn't get a response there — try asking again?"
     return {"reply": reply, "used_search": search_context is not None}
+
+
+MAX_AUDIO_BYTES = 8 * 1024 * 1024  # ~8MB — generous for a short voice clip, blocks abuse
+
+
+@app.post("/api/transcribe")
+async def transcribe(request: Request):
+    _check_rate_limit("transcribe", _client_ip(request))
+
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(status_code=400, detail="No audio received.")
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="That clip is too long.")
+
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wf:
+            sample_rate = wf.getframerate()
+            channels = wf.getnchannels()
+            frames = wf.readframes(wf.getnframes())
+    except (wave.Error, EOFError):
+        raise HTTPException(status_code=400, detail="Invalid audio — expected a WAV clip.")
+
+    config = riva.client.RecognitionConfig(
+        encoding=riva.client.AudioEncoding.LINEAR_PCM,
+        sample_rate_hertz=sample_rate,
+        audio_channel_count=channels,
+        language_code="en-US",
+        max_alternatives=1,
+        enable_automatic_punctuation=True,
+    )
+
+    t0 = time.monotonic()
+    try:
+        asr = _get_riva_asr()
+        response = await asyncio.to_thread(asr.offline_recognize, frames, config)
+        print(f"[dattas-flow] Riva ASR OK in {time.monotonic() - t0:.2f}s")
+    except Exception as exc:
+        print(f"[dattas-flow] Riva ASR ERROR after {time.monotonic() - t0:.2f}s: {exc!r}")
+        raise HTTPException(status_code=502, detail="Transcription service unavailable. Try again.")
+
+    if not response.results:
+        return {"transcript": ""}
+
+    transcript = " ".join(
+        r.alternatives[0].transcript.strip() for r in response.results if r.alternatives
+    ).strip()
+    return {"transcript": transcript}
 
 
 @app.get("/api/health")

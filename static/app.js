@@ -125,63 +125,182 @@ modeButtons.forEach((btn) => {
   });
 });
 
-// --- Speech-to-text ---
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-let recognizer = null;
-let listening = false;
-let heyFlowActive = false;
-let heyFlowRecognizer = null;
+// --- Manual mic: real push-to-talk recording, transcribed server-side by
+// NVIDIA Riva (Parakeet ASR) instead of the browser's built-in speech
+// recognition, which is noticeably worse at accuracy and gives no way to
+// know if it actually heard you. Tap to start, tap again to stop — no
+// silence-detection guessing about when you're done talking. ---
+let audioCtx = null;
+let mediaStream = null;
+let sourceNode = null;
+let processorNode = null;
+let silentGain = null;
+let recordedChunks = [];
+let isRecording = false;
+let recordTimeoutId = null;
+const MAX_RECORD_SECONDS = 45;
 
-if (SpeechRecognition) {
-  // Single-shot "tap to talk" recognizer
-  recognizer = new SpeechRecognition();
-  recognizer.lang = "en-US";
-  recognizer.interimResults = false;
-  recognizer.maxAlternatives = 1;
+function floatTo16BitPCM(float32Array) {
+  const buffer = new ArrayBuffer(float32Array.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0; i < float32Array.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Uint8Array(buffer);
+}
 
-  recognizer.onstart = () => {
-    listening = true;
-    micBtn.classList.add("listening");
-    statusEl.textContent = "Listening...";
+function buildWavBlob(chunks, sampleRate) {
+  let totalLength = 0;
+  for (const c of chunks) totalLength += c.length;
+  const pcm = new Float32Array(totalLength);
+  let offset = 0;
+  for (const c of chunks) {
+    pcm.set(c, offset);
+    offset += c.length;
+  }
+  const pcm16 = floatTo16BitPCM(pcm);
+
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+  const writeStr = (o, s) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i));
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + pcm16.byteLength, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, pcm16.byteLength, true);
+
+  return new Blob([header, pcm16], { type: "audio/wav" });
+}
+
+function updateLevelMeter(data) {
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+  const rms = Math.sqrt(sum / data.length);
+  const level = Math.min(1, rms * 6);
+  micBtn.style.boxShadow = `0 0 0 ${4 + level * 16}px rgba(217,98,43,${0.15 + level * 0.4})`;
+}
+
+async function startRecording() {
+  if (typeof heyFlowActive !== "undefined" && heyFlowActive) stopHeyFlow();
+
+  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+  processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  silentGain = audioCtx.createGain();
+  silentGain.gain.value = 0;
+  recordedChunks = [];
+
+  processorNode.onaudioprocess = (e) => {
+    const data = e.inputBuffer.getChannelData(0);
+    recordedChunks.push(new Float32Array(data));
+    updateLevelMeter(data);
   };
 
-  recognizer.onresult = (event) => {
-    const transcript = event.results[0][0].transcript;
-    sendMessage(transcript);
-  };
+  sourceNode.connect(processorNode);
+  processorNode.connect(silentGain);
+  silentGain.connect(audioCtx.destination);
 
-  recognizer.onerror = (event) => {
-    statusEl.textContent = `Mic error: ${event.error}`;
-  };
+  isRecording = true;
+  micBtn.classList.add("listening");
+  statusEl.textContent = "Recording — tap the mic again when you're done";
 
-  recognizer.onend = () => {
-    listening = false;
-    micBtn.classList.remove("listening");
-    if (statusEl.textContent === "Listening...") statusEl.textContent = "";
-  };
+  recordTimeoutId = setTimeout(stopRecordingAndTranscribe, MAX_RECORD_SECONDS * 1000);
+}
 
-  const toggleMic = () => {
-    if (heyFlowActive) stopHeyFlow();
-    if (listening) {
-      recognizer.stop();
+async function stopRecordingAndTranscribe() {
+  if (!isRecording) return;
+  isRecording = false;
+  clearTimeout(recordTimeoutId);
+  micBtn.classList.remove("listening");
+  micBtn.style.boxShadow = "";
+
+  try {
+    processorNode.disconnect();
+    sourceNode.disconnect();
+    silentGain.disconnect();
+  } catch (e) { /* already disconnected */ }
+  mediaStream.getTracks().forEach((t) => t.stop());
+  const sampleRate = audioCtx.sampleRate;
+  await audioCtx.close();
+
+  if (!recordedChunks.length) {
+    statusEl.textContent = "";
+    return;
+  }
+
+  statusEl.textContent = "Transcribing...";
+  const wavBlob = buildWavBlob(recordedChunks, sampleRate);
+  recordedChunks = [];
+
+  try {
+    const res = await fetch("/api/transcribe", {
+      method: "POST",
+      headers: { "Content-Type": "audio/wav" },
+      body: wavBlob,
+    });
+    if (!res.ok) throw new Error(`Transcription failed (${res.status})`);
+    const data = await res.json();
+    if (data.transcript && data.transcript.trim()) {
+      sendMessage(data.transcript.trim());
     } else {
-      recognizer.start();
+      statusEl.textContent = "Didn't catch that — try again?";
     }
-  };
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = "Transcription failed. Try again?";
+  }
+}
 
+const toggleMic = async () => {
+  if (isRecording) {
+    stopRecordingAndTranscribe();
+    return;
+  }
+  try {
+    await startRecording();
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = "Couldn't access the microphone.";
+  }
+};
+
+if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
   micBtn.addEventListener("click", toggleMic);
-
   window.addEventListener("keydown", (e) => {
     if (e.ctrlKey && e.shiftKey && e.code === "Space") {
       e.preventDefault();
       toggleMic();
     }
   });
+} else {
+  micBtn.disabled = true;
+  micBtn.title = "Microphone recording isn't supported in this browser";
+}
 
-  // --- "Hey Flow" hands-free wake phrase (continuous listening) ---
-  // Real background wake-word detection (like "Hey Siri") needs a native app;
-  // a web page can only listen while it's open, in the foreground, and the
-  // screen is on. This is the closest practical equivalent for a web app.
+// --- "Hey Flow" hands-free wake phrase (continuous listening) ---
+// This still uses the browser's built-in speech recognition, not Riva:
+// it's just spotting a trigger word, not transcribing content, so the
+// lower accuracy doesn't matter and running it continuously through a
+// paid cloud ASR service would be wasteful. Real background wake-word
+// detection (like "Hey Siri") needs a native app; a web page can only
+// listen while it's open, in the foreground, and the screen is on.
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let heyFlowActive = false;
+let heyFlowRecognizer = null;
+
+if (SpeechRecognition) {
   const WAKE_PATTERN = /^(hey|hi|hi there|ok|okay)[,.\s]+flow\b[,:.\s]*/i;
 
   function buildHeyFlowRecognizer() {
@@ -258,7 +377,7 @@ if (SpeechRecognition) {
       stopHeyFlow();
       return;
     }
-    if (listening) recognizer.stop();
+    if (isRecording) stopRecordingAndTranscribe();
     heyFlowActive = true;
     updateHeyFlowUI();
     startHeyFlowRecognizer();
@@ -270,8 +389,6 @@ if (SpeechRecognition) {
     }
   });
 } else {
-  micBtn.disabled = true;
-  micBtn.title = "Speech recognition not supported in this browser (try Chrome)";
   heyFlowBtn.disabled = true;
-  heyFlowBtn.title = "Speech recognition not supported in this browser";
+  heyFlowBtn.title = "Not supported in this browser";
 }
