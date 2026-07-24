@@ -302,28 +302,76 @@ let heyFlowRecognizer = null;
 
 if (SpeechRecognition) {
   const WAKE_PATTERN = /^(hey|hi|hi there|ok|okay)[,.\s]+flow\b[,:.\s]*/i;
+  const AWAIT_QUERY_MS = 7000;
+
+  // Real-world usage is almost always "Hey Flow" ...(brief pause)... "what's
+  // the weather" -- the browser splits that into two separate recognized
+  // chunks. This state tracks "wake phrase heard, now waiting for the
+  // actual question to arrive as the next chunk" so those two get stitched
+  // together instead of only working when said in one unbroken breath.
+  let awaitingQuery = false;
+  let awaitingQueryTimeout = null;
+
+  function beep() {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.18);
+      osc.onended = () => ctx.close();
+    } catch (e) { /* audio not available, non-critical */ }
+  }
+
+  function armAwaitingQuery() {
+    awaitingQuery = true;
+    statusEl.textContent = "I'm listening, go ahead...";
+    beep();
+    clearTimeout(awaitingQueryTimeout);
+    awaitingQueryTimeout = setTimeout(() => {
+      if (awaitingQuery) {
+        awaitingQuery = false;
+        if (heyFlowActive) statusEl.textContent = 'Listening for "Hey Flow"...';
+      }
+    }, AWAIT_QUERY_MS);
+  }
 
   function buildHeyFlowRecognizer() {
     const r = new SpeechRecognition();
     r.lang = "en-US";
-    r.continuous = true;
+    // Non-continuous, auto-restarted on every end (see onend below) instead
+    // of continuous:true -- continuous mode is notoriously flaky across
+    // browsers, especially on mobile, where it silently stops working.
+    // Short restarted sessions are more reliable in practice.
+    r.continuous = false;
     r.interimResults = false;
     r.maxAlternatives = 1;
 
     r.onresult = (event) => {
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (!result.isFinal) continue;
-        const transcript = result[0].transcript.trim();
-        const match = transcript.match(WAKE_PATTERN);
-        if (match) {
-          const query = transcript.slice(match[0].length).trim();
-          if (query) {
-            statusEl.textContent = "Heard you — thinking...";
-            sendMessage(query);
-          } else {
-            statusEl.textContent = "I'm listening, go ahead...";
-          }
+      const transcript = event.results[event.results.length - 1][0].transcript.trim();
+      if (!transcript) return;
+
+      if (awaitingQuery) {
+        clearTimeout(awaitingQueryTimeout);
+        awaitingQuery = false;
+        statusEl.textContent = "Heard you — thinking...";
+        sendMessage(transcript);
+        return;
+      }
+
+      const match = transcript.match(WAKE_PATTERN);
+      if (match) {
+        const query = transcript.slice(match[0].length).trim();
+        if (query) {
+          statusEl.textContent = "Heard you — thinking...";
+          sendMessage(query);
+        } else {
+          armAwaitingQuery();
         }
       }
     };
@@ -358,11 +406,15 @@ if (SpeechRecognition) {
 
   function stopHeyFlow() {
     heyFlowActive = false;
+    awaitingQuery = false;
+    clearTimeout(awaitingQueryTimeout);
     updateHeyFlowUI();
     if (heyFlowRecognizer) {
       try { heyFlowRecognizer.stop(); } catch (e) { /* not running */ }
     }
-    if (statusEl.textContent.startsWith("Listening for")) statusEl.textContent = "";
+    if (statusEl.textContent.startsWith("Listening for") || statusEl.textContent.startsWith("I'm listening")) {
+      statusEl.textContent = "";
+    }
   }
 
   function updateHeyFlowUI() {
